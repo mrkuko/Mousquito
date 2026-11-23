@@ -1,0 +1,43 @@
+# Build and test on every push to main and every pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  cxx: g++ }
+          - { os: ubuntu-latest,  cxx: clang++ }
+          - { os: macos-latest,   cxx: clang++ }
+          - { os: windows-latest, cxx: "" }      # MSVC
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cxx }}" ]; then export CXX=${{ matrix.cxx }}; fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DMOUSQUITO_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          exe=build/mousquito
+          [ -f build/Release/mousquito.exe ] && exe=build/Release/mousquito.exe
+          "$exe" --version
