@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "geometry.hpp"
+#include "random.hpp"
 #include "version.hpp"
 
 static int failures = 0;
@@ -143,12 +144,146 @@ static void testArcLength() {
     CHECK(approx(tiny.tAtLength(250), 0.5, 1e-12));
 }
 
+static void testRandom() {
+    // The engine itself is the standard one: the C++ standard fixes the 10000th output of
+    // a default-seeded mt19937_64.
+    {
+        mq::Rng r(5489);
+        uint64_t x = 0;
+        for (int i = 0; i < 10000; ++i) x = r.nextU64();
+        CHECK(x == 9981545732273789042ull);
+    }
+
+    // Golden values for seed 7. If these fail on one OS only, --seed is not portable there.
+    {
+        mq::Rng r(7);
+        CHECK(r.nextU64() == 13915952638675311015ull);
+        CHECK(r.uniform01() == 0.94930120289264419);
+        CHECK(r.uniformInt(-100, 100) == 5);
+        CHECK(approx(r.normal(0, 1), 1.3315647985499977, 1e-12));
+        CHECK(r.chance(50));
+    }
+
+    // Same seed, same sequence. Different seed, different sequence.
+    {
+        mq::Rng a(42), b(42), c(43);
+        bool same = true, differs = false;
+        for (int i = 0; i < 100; ++i) {
+            const double va = a.normal(0, 1), vb = b.normal(0, 1), vc = c.normal(0, 1);
+            if (va != vb) same = false;
+            if (va != vc) differs = true;
+        }
+        CHECK(same);
+        CHECK(differs);
+    }
+
+    const int n = 200000;
+
+    // uniform01 stays in [0, 1) and averages 0.5. uniform(a, b) stays in [a, b).
+    {
+        mq::Rng r(1);
+        double sum = 0, lo = 1, hi = 0;
+        bool inside = true;
+        for (int i = 0; i < n; ++i) {
+            const double u = r.uniform01();
+            sum += u;
+            lo = std::fmin(lo, u);
+            hi = std::fmax(hi, u);
+            const double v = r.uniform(mq::Range{-3, 5});
+            if (v < -3 || v >= 5) inside = false;
+        }
+        CHECK(lo >= 0.0 && hi < 1.0);
+        CHECK(approx(sum / n, 0.5, 0.005));
+        CHECK(inside);
+    }
+
+    // uniformInt hits both ends and nothing outside, also for negative and one-value ranges.
+    {
+        mq::Rng r(2);
+        int counts[7] = {};
+        bool inside = true;
+        for (int i = 0; i < 70000; ++i) {
+            const int v = r.uniformInt(-3, 3);
+            if (v < -3 || v > 3) inside = false;
+            else ++counts[v + 3];
+        }
+        CHECK(inside);
+        bool even = true;
+        for (int c : counts)
+            if (c < 9000 || c > 11000) even = false;
+        CHECK(even);
+        CHECK(r.uniformInt(4, 4) == 4);
+        CHECK(r.uniformInt(9, 2) == 9); // reversed range: lo
+    }
+
+    // normal has the requested mean and standard deviation.
+    {
+        mq::Rng r(3);
+        double sum = 0, sq = 0;
+        for (int i = 0; i < n; ++i) {
+            const double v = r.normal(10, 2);
+            sum += v;
+            sq += v * v;
+        }
+        const double mean = sum / n;
+        const double sd = std::sqrt(sq / n - mean * mean);
+        CHECK(approx(mean, 10.0, 0.02));
+        CHECK(approx(sd, 2.0, 0.02));
+    }
+
+    // logNormalMean1 averages 1, is always positive, and is exactly 1 with sigma 0.
+    {
+        mq::Rng r(4);
+        double sum = 0, lo = 1e9, hi = 0;
+        for (int i = 0; i < n; ++i) {
+            const double v = r.logNormalMean1(0.3);
+            sum += v;
+            lo = std::fmin(lo, v);
+            hi = std::fmax(hi, v);
+        }
+        CHECK(approx(sum / n, 1.0, 0.005));
+        CHECK(lo > 0.0);
+        CHECK(hi > 2.0); // right-skewed: occasional long values
+        CHECK(r.logNormalMean1(0.0) == 1.0);
+    }
+
+    // chance: 0 never, 100 always, 25 about a quarter of the time.
+    {
+        mq::Rng r(5);
+        int never = 0, always = 0, quarter = 0;
+        for (int i = 0; i < n; ++i) {
+            if (r.chance(0)) ++never;
+            if (r.chance(100)) ++always;
+            if (r.chance(25)) ++quarter;
+        }
+        CHECK(never == 0);
+        CHECK(always == n);
+        CHECK(approx(quarter / double(n), 0.25, 0.005));
+    }
+
+    // Each call consumes the same amount whatever its arguments, so changing one parameter
+    // does not shift the random decisions that come after it.
+    {
+        mq::Rng a(6), b(6);
+        a.chance(0);
+        b.chance(50);
+        a.logNormalMean1(0.0);
+        b.logNormalMean1(0.4);
+        a.uniformInt(1, 1);
+        b.uniformInt(1, 6);
+        CHECK(a.nextU64() == b.nextU64());
+    }
+
+    CHECK(mq::randomSeed() != mq::randomSeed());
+}
+
 int main() {
     testVersion();
     testVectors();
     testRect();
     testBezier();
     testArcLength();
+    testRandom();
     if (failures == 0) std::puts("all tests passed");
     return failures == 0 ? 0 : 1;
 }
