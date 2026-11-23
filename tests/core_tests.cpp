@@ -356,8 +356,8 @@ static const char* brokenRule(const mq::Trajectory& t, mq::Point from, mq::Point
     if (t.durationMs() > mq::kMaxDurationMs + dt) return "longer than the maximum duration";
 
     // No teleports: no step is much longer than the fastest the cursor should ever go.
-    // Minimum-jerk peaks at 1.875 × the average speed of the move.
-    const double peak = 1.875 * mq::distance(mq::toVec2(from), mq::toVec2(to)) / t.durationMs();
+    // Minimum-jerk peaks at 1.875 × the average speed along the path.
+    const double peak = 1.875 * t.length() / t.durationMs();
     for (size_t i = 1; i < s.size(); ++i) {
         const double step = mq::distance(mq::toVec2(s[i - 1].point()), mq::toVec2(s[i].point()));
         if (step > peak * (s[i].tMs - s[i - 1].tMs) * 1.5 + 2.0) return "teleport";
@@ -502,6 +502,142 @@ static void testPlanMove() {
     }
 }
 
+// Signed distance of `p` from the line a → b: positive on one side, negative on the other.
+static double sideOf(mq::Vec2 p, mq::Vec2 a, mq::Vec2 b) {
+    const mq::Vec2 u = mq::normalized(b - a);
+    const mq::Vec2 d = p - a;
+    return u.x * d.y - u.y * d.x;
+}
+
+// Signed curvature direction of a Bézier at t: the sign of B' × B''.
+static double turnAt(const mq::CubicBezier& c, double t) {
+    const mq::Vec2 d1 = c.derivative(t);
+    const double h = 1e-4;
+    const mq::Vec2 d2 = (c.derivative(t + h) - c.derivative(t - h)) / (2 * h);
+    return d1.x * d2.y - d1.y * d2.x;
+}
+
+static void testCurvedPaths() {
+    const mq::Vec2 a(100, 100), b(900, 500);
+
+    // The bend distance is the distance up to 300 px and grows more slowly after.
+    CHECK(mq::bendDistancePx(200) == 200);
+    CHECK(approx(mq::bendDistancePx(300), 300, 1e-9));
+    CHECK(mq::bendDistancePx(3000) > mq::bendDistancePx(1000));
+    CHECK(mq::bendDistancePx(3000) < 3000 * 0.6);
+
+    // Curvature 0: a straight path, every sample within a pixel of the line.
+    {
+        mq::MotionConfig straight;
+        straight.curvature = 0;
+        bool onLine = true;
+        for (uint64_t seed = 0; seed < 50; ++seed) {
+            mq::Rng rng(seed);
+            const auto t = mq::planMove({100, 100}, {900, 500}, straight, rng);
+            for (const auto& s : t.samples())
+                if (std::fabs(sideOf(mq::toVec2(s.point()), a, b)) > 1.0) onLine = false;
+        }
+        CHECK(onLine);
+    }
+
+    // Without S-curves, every path is one arc: its curvature never changes sign, and all
+    // samples stay on one side of the straight line. Both sides occur across seeds.
+    {
+        mq::MotionConfig arc;
+        arc.curvature = 0.6;
+        arc.sCurveChancePct = 0;
+        bool oneTurn = true, oneSide = true;
+        int left = 0, right = 0;
+        for (uint64_t seed = 0; seed < 200; ++seed) {
+            mq::Rng r1(seed);
+            const mq::CubicBezier c = mq::planPath(a, b, arc, r1);
+            const double first = turnAt(c, 0.01);
+            for (int i = 1; i < 100; ++i)
+                if (turnAt(c, i / 100.0) * first < 0) oneTurn = false;
+
+            mq::Rng r2(seed);
+            const auto t = mq::planMove({100, 100}, {900, 500}, arc, r2);
+            double lo = 0, hi = 0;
+            for (const auto& s : t.samples()) {
+                const double d = sideOf(mq::toVec2(s.point()), a, b);
+                lo = std::fmin(lo, d);
+                hi = std::fmax(hi, d);
+            }
+            if (lo < -1.0 && hi > 1.0) oneSide = false;
+            if (hi > 5) ++left;
+            if (lo < -5) ++right;
+        }
+        CHECK(oneTurn);
+        CHECK(oneSide);
+        CHECK(left > 50 && right > 50);
+    }
+
+    // With S-curves always on, the curvature changes sign.
+    {
+        mq::MotionConfig s;
+        s.curvature = 0.6;
+        s.sCurveChancePct = 100;
+        int turns = 0;
+        for (uint64_t seed = 0; seed < 100; ++seed) {
+            mq::Rng rng(seed);
+            const mq::CubicBezier c = mq::planPath(a, b, s, rng);
+            if (turnAt(c, 0.1) * turnAt(c, 0.9) < 0) ++turns;
+        }
+        CHECK(turns > 90);
+    }
+
+    // More curvature bends more. Long moves bend less relative to their length.
+    {
+        auto meanBend = [](double curvature, int dist) {
+            mq::MotionConfig cfg;
+            cfg.curvature = curvature;
+            cfg.sCurveChancePct = 0;
+            double sum = 0;
+            for (uint64_t seed = 0; seed < 300; ++seed) {
+                mq::Rng rng(seed);
+                const mq::CubicBezier c = mq::planPath({0, 0}, {double(dist), 0}, cfg, rng);
+                double most = 0;
+                for (int i = 0; i <= 50; ++i) most = std::fmax(most, std::fabs(c.at(i / 50.0).y));
+                sum += most;
+            }
+            return sum / 300;
+        };
+        CHECK(meanBend(0.6, 800) > meanBend(0.3, 800) * 1.5);
+        CHECK(meanBend(0.3, 800) > 5);
+        CHECK(meanBend(0.3, 3000) / 3000 < meanBend(0.3, 300) / 300 * 0.7);
+        CHECK(meanBend(0.3, 3000) > meanBend(0.3, 300));
+    }
+
+    // Arc length keeps the speed right on a curve: with a strong bend the peak is still in
+    // the middle of the move, and the path is longer than the straight distance.
+    {
+        mq::MotionConfig bent;
+        bent.curvature = 1.0;
+        bent.sCurveChancePct = 0;
+        bent.jitterPct = 0;
+        bent.rateHz = 250;
+        mq::Rng rng(4);
+        const auto t = mq::planMove({0, 0}, {1000, 0}, bent, rng);
+        const double at = t.peakSpeedTimeMs() / t.durationMs();
+        CHECK(at > 0.4 && at < 0.6);
+        CHECK(t.straightness() < 0.99);
+    }
+
+    // The basic rules still hold for very bent paths and S-curves.
+    {
+        mq::MotionConfig wild;
+        wild.curvature = 1.0;
+        wild.sCurveChancePct = 50;
+        const char* broken = nullptr;
+        for (uint64_t seed = 0; seed < 300 && !broken; ++seed) {
+            mq::Rng rng(seed);
+            const mq::Point to{static_cast<int>(seed * 37 % 2000) - 1000, static_cast<int>(seed * 53 % 1200) - 600};
+            broken = brokenRule(mq::planMove({0, 0}, to, wild, rng), {0, 0}, to, wild);
+        }
+        CHECK(broken == nullptr);
+    }
+}
+
 int main() {
     testVersion();
     testVectors();
@@ -512,6 +648,7 @@ int main() {
     testTrajectory();
     testFitts();
     testPlanMove();
+    testCurvedPaths();
     if (failures == 0) std::puts("all tests passed");
     return failures == 0 ? 0 : 1;
 }

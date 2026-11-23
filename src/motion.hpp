@@ -15,6 +15,9 @@ struct MotionConfig {
     double targetSizePx = 16.0; // target width W for Fitts's law
     double rateHz = 125.0;      // cursor update rate
 
+    double curvature = 0.30;      // how much paths bend, 0 = straight
+    double sCurveChancePct = 5.0; // chance that the path bends one way, then the other
+
     // Fitts's law constants: T = a + b · log2(D / W + 1).
     double fittsAMs = 80.0;
     double fittsBMs = 130.0;
@@ -37,9 +40,20 @@ inline double minimumJerk(double tau) {
     return t3 * (10.0 + tau * (-15.0 + 6.0 * tau));
 }
 
+// Distance used to scale the bend of a path. Equal to the distance up to 300 px, then it
+// grows more slowly, so long moves are not absurdly curved.
+double bendDistancePx(double distancePx);
+
+// The shape of a move from `a` to `b`: a cubic Bézier whose control points lie at 30 % and
+// 70 % of the way, pushed sideways by a random amount scaled by cfg.curvature. Both are
+// pushed to the same side (one smooth arc), except with probability cfg.sCurveChancePct,
+// when the second one goes to the other side (a gentle S).
+CubicBezier planPath(Vec2 a, Vec2 b, const MotionConfig& cfg, Rng& rng);
+
 // Plans the cursor path from `from` to `to`.
 //
-// The first sample is `from` at t = 0, the last one is exactly `to`. Samples are taken every
+// The cursor follows planPath() with the minimum-jerk speed profile. Positions are taken by
+// arc length, so the speed along a curve is right. The first sample is `from` at t = 0, the last one is exactly `to`. Samples are taken every
 // 1000 / rateHz ms. A sample on the same pixel as the previous one is dropped (time still
 // advances), except the final one, which always marks the end of the move. A move shorter
 // than 1 px returns an empty trajectory.
