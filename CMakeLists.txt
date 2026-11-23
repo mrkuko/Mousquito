@@ -16,6 +16,7 @@ option(MOUSQUITO_WERROR "Treat compiler warnings as errors (used by CI)" OFF)
 
 # Platform-independent core: the movement engine. No OS calls in here.
 add_library(mousquito_core STATIC
+  src/motion.cpp
   src/trajectory.cpp
   src/version.cpp
 )

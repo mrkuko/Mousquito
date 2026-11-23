@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "geometry.hpp"
+#include "motion.hpp"
 #include "random.hpp"
 #include "trajectory.hpp"
 #include "version.hpp"
@@ -339,6 +340,168 @@ static void testTrajectory() {
     }
 }
 
+// The rules every planned move must keep. Returns a description of the first broken rule,
+// or nullptr when all hold.
+static const char* brokenRule(const mq::Trajectory& t, mq::Point from, mq::Point to, const mq::MotionConfig& cfg) {
+    if (t.empty()) return "empty";
+    if (t.front().point() != from || t.front().tMs != 0.0) return "first sample is not the start at t = 0";
+    if (t.back().point() != to) return "last sample is not the target";
+    const auto& s = t.samples();
+    for (size_t i = 1; i < s.size(); ++i) {
+        if (s[i].tMs <= s[i - 1].tMs) return "timestamps do not strictly increase";
+        if (s[i].point() == s[i - 1].point() && i + 1 != s.size()) return "duplicate pixel before the end";
+    }
+    if (t.durationMs() < mq::kMinDurationMs) return "shorter than the minimum duration";
+    const double dt = 1000.0 / cfg.rateHz;
+    if (t.durationMs() > mq::kMaxDurationMs + dt) return "longer than the maximum duration";
+
+    // No teleports: no step is much longer than the fastest the cursor should ever go.
+    // Minimum-jerk peaks at 1.875 × the average speed of the move.
+    const double peak = 1.875 * mq::distance(mq::toVec2(from), mq::toVec2(to)) / t.durationMs();
+    for (size_t i = 1; i < s.size(); ++i) {
+        const double step = mq::distance(mq::toVec2(s[i - 1].point()), mq::toVec2(s[i].point()));
+        if (step > peak * (s[i].tMs - s[i - 1].tMs) * 1.5 + 2.0) return "teleport";
+    }
+    return nullptr;
+}
+
+static void testFitts() {
+    mq::MotionConfig cfg;
+    CHECK(approx(mq::fittsIdBits(500, 16), std::log2(500.0 / 16 + 1), 1e-12));
+    CHECK(mq::fittsIdBits(0, 16) == 0.0);
+
+    // 80 + 130 · log2(500/16 + 1) ≈ 731.4 ms, and --speed divides it.
+    const double t500 = 80 + 130 * std::log2(500.0 / 16 + 1);
+    CHECK(approx(mq::fittsDurationMs(500, cfg), t500, 1e-9));
+    cfg.speed = 2;
+    CHECK(approx(mq::fittsDurationMs(500, cfg), t500 / 2, 1e-9));
+
+    // Clamped at both ends.
+    cfg.speed = 10;
+    CHECK(mq::fittsDurationMs(10, cfg) == mq::kMinDurationMs);
+    cfg.speed = 0.01;
+    CHECK(mq::fittsDurationMs(3000, cfg) == mq::kMaxDurationMs);
+
+    // A bigger target is quicker to hit.
+    mq::MotionConfig big;
+    big.targetSizePx = 64;
+    CHECK(mq::fittsDurationMs(500, big) < mq::fittsDurationMs(500, mq::MotionConfig{}));
+
+    // The minimum-jerk profile goes 0 → 1, is symmetric and never goes backwards.
+    CHECK(mq::minimumJerk(0.0) == 0.0);
+    CHECK(approx(mq::minimumJerk(1.0), 1.0, 1e-12));
+    CHECK(approx(mq::minimumJerk(0.5), 0.5, 1e-12));
+    CHECK(approx(mq::minimumJerk(0.2) + mq::minimumJerk(0.8), 1.0, 1e-12));
+    bool monotonic = true;
+    for (int i = 1; i <= 1000; ++i)
+        if (mq::minimumJerk(i / 1000.0) < mq::minimumJerk((i - 1) / 1000.0)) monotonic = false;
+    CHECK(monotonic);
+}
+
+static void testPlanMove() {
+    const mq::MotionConfig cfg;
+
+    // The rules hold for many seeds, distances and directions, also at negative coordinates.
+    {
+        const mq::Point starts[] = {{0, 0}, {-1500, 300}, {640, -200}};
+        const double dirs[][2] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}, {0.6, 0.8}, {-0.8, 0.6}, {-0.6, -0.8}, {0.28, -0.96}};
+        const int distances[] = {1, 5, 50, 500, 3000};
+        const char* firstBroken = nullptr;
+        int runs = 0;
+        for (const mq::Point from : starts)
+            for (const auto& d : dirs)
+                for (const int dist : distances)
+                    for (uint64_t seed = 0; seed < 40; ++seed) {
+                        const mq::Point to{from.x + static_cast<int>(std::lround(d[0] * dist)),
+                                           from.y + static_cast<int>(std::lround(d[1] * dist))};
+                        mq::Rng rng(seed);
+                        const char* broken = brokenRule(mq::planMove(from, to, cfg, rng), from, to, cfg);
+                        if (broken && !firstBroken) {
+                            firstBroken = broken;
+                            std::fprintf(stderr, "  move (%d,%d) -> (%d,%d) seed %llu: %s\n", from.x, from.y,
+                                         to.x, to.y, static_cast<unsigned long long>(seed), broken);
+                        }
+                        ++runs;
+                    }
+        CHECK(firstBroken == nullptr);
+        CHECK(runs == 3 * 8 * 5 * 40);
+    }
+
+    // No distance, no move. One pixel still lands.
+    {
+        mq::Rng rng(1);
+        CHECK(mq::planMove({7, 7}, {7, 7}, cfg, rng).empty());
+        const mq::Trajectory one = mq::planMove({7, 7}, {8, 7}, cfg, rng);
+        CHECK(brokenRule(one, {7, 7}, {8, 7}, cfg) == nullptr);
+    }
+
+    // Same seed, same path. Another seed, another path.
+    {
+        mq::Rng a(9), b(9), c(10);
+        const auto ta = mq::planMove({0, 0}, {800, 450}, cfg, a);
+        const auto tb = mq::planMove({0, 0}, {800, 450}, cfg, b);
+        const auto tc = mq::planMove({0, 0}, {800, 450}, cfg, c);
+        bool same = ta.size() == tb.size();
+        for (size_t i = 0; same && i < ta.size(); ++i)
+            same = ta.samples()[i].tMs == tb.samples()[i].tMs && ta.samples()[i].point() == tb.samples()[i].point();
+        CHECK(same);
+        CHECK(ta.durationMs() != tc.durationMs());
+    }
+
+    // Without jitter, longer moves never take less time (Fitts).
+    {
+        mq::MotionConfig steady = cfg;
+        steady.jitterPct = 0;
+        double prev = 0;
+        bool grows = true;
+        for (int dist = 1; dist <= 3000; dist += 7) {
+            mq::Rng rng(1);
+            const double d = mq::planMove({0, 0}, {dist, 0}, steady, rng).durationMs();
+            if (d < prev) grows = false;
+            prev = d;
+        }
+        CHECK(grows);
+        mq::Rng r1(1), r2(1);
+        CHECK(mq::planMove({0, 0}, {50, 0}, steady, r1).durationMs() < mq::planMove({0, 0}, {1000, 0}, steady, r2).durationMs());
+    }
+
+    // With jitter the average duration stays at Fitts's value.
+    {
+        double sum = 0;
+        const int n = 2000;
+        for (uint64_t seed = 0; seed < n; ++seed) {
+            mq::Rng rng(seed);
+            sum += mq::planMove({0, 0}, {500, 0}, cfg, rng).durationMs();
+        }
+        const double expected = mq::fittsDurationMs(500, cfg);
+        CHECK(sum / n > expected * 0.97 && sum / n < expected * 1.03 + 8); // + up to one tick
+    }
+
+    // --duration fixes the length of the move (rounded up to the next tick).
+    {
+        mq::MotionConfig fixed = cfg;
+        fixed.durationMs = 700;
+        mq::Rng rng(3);
+        const double d = mq::planMove({0, 0}, {300, 200}, fixed, rng).durationMs();
+        CHECK(d >= 700 && d < 708);
+    }
+
+    // Samples sit on the update-rate grid, and the speed peaks in the middle (no skew yet).
+    {
+        mq::MotionConfig steady = cfg;
+        steady.jitterPct = 0;
+        steady.rateHz = 250;
+        mq::Rng rng(4);
+        const auto t = mq::planMove({0, 0}, {1000, 0}, steady, rng);
+        bool onGrid = true;
+        for (const auto& s : t.samples())
+            if (!approx(s.tMs / 4.0, std::round(s.tMs / 4.0), 1e-9)) onGrid = false;
+        CHECK(onGrid);
+        const double at = t.peakSpeedTimeMs() / t.durationMs();
+        CHECK(at > 0.4 && at < 0.6);
+    }
+}
+
 int main() {
     testVersion();
     testVectors();
@@ -347,6 +510,8 @@ int main() {
     testArcLength();
     testRandom();
     testTrajectory();
+    testFitts();
+    testPlanMove();
     if (failures == 0) std::puts("all tests passed");
     return failures == 0 ? 0 : 1;
 }
