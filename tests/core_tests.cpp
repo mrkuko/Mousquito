@@ -486,7 +486,7 @@ static void testPlanMove() {
         CHECK(d >= 700 && d < 708);
     }
 
-    // Samples sit on the update-rate grid, and the speed peaks in the middle (no skew yet).
+    // Samples sit on the update-rate grid, and the speed peaks around the middle of the move.
     {
         mq::MotionConfig steady = cfg;
         steady.jitterPct = 0;
@@ -500,6 +500,25 @@ static void testPlanMove() {
         const double at = t.peakSpeedTimeMs() / t.durationMs();
         CHECK(at > 0.4 && at < 0.6);
     }
+}
+
+// Share of the duration at which the speed is highest, with the speed averaged over a window
+// of 12 % of the duration. Whole-pixel rounding makes single steps too noisy for this.
+static double smoothPeakShare(const mq::Trajectory& t) {
+    const auto& s = t.samples();
+    const double total = t.durationMs(), window = 0.12 * total;
+    double best = -1, at = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        size_t j = i;
+        while (j + 1 < s.size() && s[j].tMs - s[i].tMs < window) ++j;
+        if (s[j].tMs - s[i].tMs < window * 0.99) break;
+        const double v = std::hypot(double(s[j].x - s[i].x), double(s[j].y - s[i].y)) / (s[j].tMs - s[i].tMs);
+        if (v > best) {
+            best = v;
+            at = (s[i].tMs + s[j].tMs) / 2 / total;
+        }
+    }
+    return at;
 }
 
 // Signed distance of `p` from the line a → b: positive on one side, negative on the other.
@@ -618,8 +637,8 @@ static void testCurvedPaths() {
         bent.rateHz = 250;
         mq::Rng rng(4);
         const auto t = mq::planMove({0, 0}, {1000, 0}, bent, rng);
-        const double at = t.peakSpeedTimeMs() / t.durationMs();
-        CHECK(at > 0.4 && at < 0.6);
+        const double at = smoothPeakShare(t);
+        CHECK(at > 0.35 && at < 0.55);
         CHECK(t.straightness() < 0.99);
     }
 
@@ -638,6 +657,63 @@ static void testCurvedPaths() {
     }
 }
 
+static void testSkewedPeak() {
+    // The warped profile keeps the ends and never goes backwards, for any peak position.
+    for (const double p : {0.35, 0.42, 0.45, 0.48, 0.5, 0.65}) {
+        CHECK(mq::skewedMinimumJerk(0.0, p) == 0.0);
+        CHECK(approx(mq::skewedMinimumJerk(1.0, p), 1.0, 1e-12));
+        bool monotonic = true;
+        for (int i = 1; i <= 2000; ++i)
+            if (mq::skewedMinimumJerk(i / 2000.0, p) < mq::skewedMinimumJerk((i - 1) / 2000.0, p)) monotonic = false;
+        CHECK(monotonic);
+    }
+    // peakAt 0.5 is the plain minimum-jerk profile.
+    CHECK(approx(mq::skewedMinimumJerk(0.3, 0.5), mq::minimumJerk(0.3), 1e-12));
+
+    // Its speed peaks near peakAt, a little before it.
+    for (const double p : {0.42, 0.45, 0.48}) {
+        double best = 0, at = 0;
+        for (int i = 1; i < 2000; ++i) {
+            const double t = i / 2000.0, h = 1e-6;
+            const double v = (mq::skewedMinimumJerk(t + h, p) - mq::skewedMinimumJerk(t - h, p)) / (2 * h);
+            if (v > best) {
+                best = v;
+                at = t;
+            }
+        }
+        CHECK(at > 0.35 && at <= p);
+    }
+
+    // On planned moves the peak falls in 35-55 % of the duration, and earlier than the middle
+    // on average. (Short moves are skipped: with a few pixels per step the peak is not readable.)
+    mq::MotionConfig cfg;
+    cfg.jitterPct = 0;
+    for (const int dist : {500, 1000, 3000}) {
+        double sum = 0;
+        bool inside = true;
+        for (uint64_t seed = 0; seed < 200; ++seed) {
+            mq::Rng rng(seed);
+            const double at = smoothPeakShare(mq::planMove({0, 0}, {dist, 0}, cfg, rng));
+            sum += at;
+            if (at < 0.35 || at > 0.55) inside = false;
+        }
+        CHECK(inside);
+        CHECK(sum / 200 < 0.47);
+    }
+
+    // The peak position changes from move to move (within the configured range), and a fixed
+    // range pins it.
+    {
+        mq::MotionConfig pinned = cfg;
+        pinned.peakAt = {0.38, 0.38}; // real peak at 0.32
+        mq::Rng rng(1);
+        const double at = smoothPeakShare(mq::planMove({0, 0}, {3000, 0}, pinned, rng));
+        CHECK(at > 0.27 && at < 0.37);
+        mq::Rng r1(1), r2(2);
+        CHECK(mq::planMove({0, 0}, {1000, 0}, cfg, r1).peakSpeedTimeMs() != mq::planMove({0, 0}, {1000, 0}, cfg, r2).peakSpeedTimeMs());
+    }
+}
+
 int main() {
     testVersion();
     testVectors();
@@ -649,6 +725,7 @@ int main() {
     testFitts();
     testPlanMove();
     testCurvedPaths();
+    testSkewedPeak();
     if (failures == 0) std::puts("all tests passed");
     return failures == 0 ? 0 : 1;
 }

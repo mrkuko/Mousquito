@@ -26,11 +26,22 @@ double mainDurationMs(double distancePx, const MotionConfig& cfg, Rng& rng) {
     return std::clamp(fittsDurationMs(distancePx, cfg) * jitter, kMinDurationMs, kMaxDurationMs);
 }
 
+// The warp only places the peak near peakAt for values close to the middle. Further out the
+// real peak drifts away (0.2 gives 0.04), so the setting is limited to a sensible range.
+constexpr double kMinPeakAt = 0.35;
+constexpr double kMaxPeakAt = 0.65;
+
 constexpr double kBendKneePx = 300.0;   // bend grows linearly up to here, then slower
 constexpr double kBendExponent = 0.75;  // growth beyond the knee: distance^0.75
 constexpr double kBendPerCurvature = 0.15; // mean sideways push = curvature · 0.15 · bend distance
 
 } // namespace
+
+double skewedMinimumJerk(double tau, double peakAt) {
+    const double p = std::clamp(peakAt, kMinPeakAt, kMaxPeakAt);
+    const double gamma = std::log(0.5) / std::log(p);
+    return minimumJerk(std::pow(std::clamp(tau, 0.0, 1.0), gamma));
+}
 
 double bendDistancePx(double distancePx) {
     if (distancePx <= kBendKneePx) return distancePx;
@@ -64,6 +75,7 @@ Trajectory planMove(Point from, Point to, const MotionConfig& cfg, Rng& rng) {
     const double dtMs = 1000.0 / (cfg.rateHz > 0.0 ? cfg.rateHz : 125.0);
     const CubicBezier path = planPath(a, b, cfg, rng);
     const ArcLengthTable table(path);
+    const double peakAt = rng.uniform(cfg.peakAt);
 
     // Samples on the fixed grid t_k = k · dt. The last one is the first grid tick at or after
     // the end of the move, and it is exactly the target.
@@ -72,7 +84,7 @@ Trajectory planMove(Point from, Point to, const MotionConfig& cfg, Rng& rng) {
     Point prev = from;
     for (long k = 1; k < lastTick; ++k) {
         const double tMs = static_cast<double>(k) * dtMs;
-        const double s = minimumJerk(tMs / durationMs) * table.length();
+        const double s = skewedMinimumJerk(tMs / durationMs, peakAt) * table.length();
         const Point p = roundToPoint(path.at(table.tAtLength(s)));
         if (p == prev) continue;
         traj.append({tMs, p.x, p.y});

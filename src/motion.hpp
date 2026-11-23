@@ -15,6 +15,10 @@ struct MotionConfig {
     double targetSizePx = 16.0; // target width W for Fitts's law
     double rateHz = 125.0;      // cursor update rate
 
+    // Where the speed peaks, as a share of the move's duration, drawn per move. People are
+    // fastest a little before the middle (they brake for longer than they accelerate).
+    Range peakAt{0.42, 0.48};
+
     double curvature = 0.30;      // how much paths bend, 0 = straight
     double sCurveChancePct = 5.0; // chance that the path bends one way, then the other
 
@@ -39,6 +43,13 @@ inline double minimumJerk(double tau) {
     const double t3 = tau * tau * tau;
     return t3 * (10.0 + tau * (-15.0 + 6.0 * tau));
 }
+
+// Minimum-jerk profile with the time warped so that the speed peaks near τ = peakAt instead
+// of exactly in the middle: τ' = τ^γ with γ = ln 0.5 / ln peakAt. The real peak is a little
+// earlier than peakAt (0.45 gives 0.43). Still 0 at τ = 0, 1 at τ = 1, never goes backwards,
+// and stops smoothly at both ends. peakAt = 0.5 is the plain minimum-jerk profile. peakAt is
+// limited to 0.35 - 0.65.
+double skewedMinimumJerk(double tau, double peakAt);
 
 // Distance used to scale the bend of a path. Equal to the distance up to 300 px, then it
 // grows more slowly, so long moves are not absurdly curved.
