@@ -4,6 +4,7 @@
 
 #include "geometry.hpp"
 #include "random.hpp"
+#include "trajectory.hpp"
 #include "version.hpp"
 
 static int failures = 0;
@@ -277,6 +278,67 @@ static void testRandom() {
     CHECK(mq::randomSeed() != mq::randomSeed());
 }
 
+static void testTrajectory() {
+    // Empty and single-sample trajectories have no duration, length or speed.
+    {
+        mq::Trajectory t;
+        CHECK(t.empty());
+        CHECK(t.durationMs() == 0.0);
+        CHECK(t.length() == 0.0);
+        CHECK(t.straightness() == 1.0);
+        CHECK(t.peakSpeed() == 0.0);
+        CHECK(t.peakSpeedTimeMs() == 0.0);
+        t.append({0, 5, 5});
+        CHECK(t.size() == 1);
+        CHECK(t.durationMs() == 0.0);
+        CHECK(t.length() == 0.0);
+        CHECK(t.peakSpeed() == 0.0);
+    }
+
+    // An L-shaped path: 30 px right in 30 ms, then 40 px down in 10 ms, then a pause.
+    //   (0,0) -> (10,0) -> (20,0) -> (30,0) -> (30,40) -> (30,40)
+    //   t = 0     10        20        30        40        50
+    {
+        mq::Trajectory t;
+        t.append({0, 0, 0});
+        t.append({10, 10, 0});
+        t.append({20, 20, 0});
+        t.append({30, 30, 0});
+        t.append({40, 30, 40});
+        t.append({50, 30, 40});
+        CHECK(t.size() == 6);
+        CHECK(t.front().point() == (mq::Point{0, 0}));
+        CHECK(t.back().point() == (mq::Point{30, 40}));
+        CHECK(approx(t.durationMs(), 50.0, 1e-12));
+        CHECK(approx(t.length(), 70.0, 1e-12));
+        CHECK(approx(t.straightness(), 50.0 / 70.0, 1e-12)); // 30-40-50 triangle
+        CHECK(approx(t.peakSpeed(), 4.0, 1e-12));            // 40 px in 10 ms
+        CHECK(approx(t.peakSpeedTimeMs(), 35.0, 1e-12));     // middle of that step
+    }
+
+    // A diagonal step counts its true length, and times are relative to the first sample.
+    {
+        mq::Trajectory t;
+        t.append({100, -3, -4});
+        t.append({105, 0, 0});
+        CHECK(approx(t.length(), 5.0, 1e-12));
+        CHECK(approx(t.durationMs(), 5.0, 1e-12));
+        CHECK(approx(t.peakSpeed(), 1.0, 1e-12));
+        CHECK(approx(t.peakSpeedTimeMs(), 2.5, 1e-12));
+        CHECK(t.straightness() == 1.0);
+    }
+
+    // A path that only waits has no speed, and a step with no time is ignored for speed.
+    {
+        mq::Trajectory t;
+        t.append({0, 1, 1});
+        t.append({8, 1, 1});
+        t.append({8, 9, 9}); // broken input: no time passes
+        CHECK(t.peakSpeed() == 0.0);
+        CHECK(t.peakSpeedTimeMs() == 0.0);
+    }
+}
+
 int main() {
     testVersion();
     testVectors();
@@ -284,6 +346,7 @@ int main() {
     testBezier();
     testArcLength();
     testRandom();
+    testTrajectory();
     if (failures == 0) std::puts("all tests passed");
     return failures == 0 ? 0 : 1;
 }
